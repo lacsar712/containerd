@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/pull"
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/core/transfer"
@@ -90,12 +91,14 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 	defer done(ctx)
 
 	var unpacker *unpack.Unpacker
+	var unpackerSnapshotter string
 
 	if pullCtx.Unpack {
 		snapshotterName, err := c.resolveSnapshotterName(ctx, pullCtx.Snapshotter)
 		if err != nil {
 			return nil, fmt.Errorf("unable to resolve snapshotter: %w", err)
 		}
+		unpackerSnapshotter = snapshotterName
 		span.SetAttributes(tracing.Attribute("snapshotter.name", snapshotterName))
 
 		snCapabilities, err := c.GetSnapshotterCapabilities(ctx, snapshotterName)
@@ -154,27 +157,58 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 		}
 	}
 
-	img, err := c.fetch(ctx, pullCtx, ref, 1)
+	// Resolve the name before any reservation so concurrent pulls of the same
+	// name coordinate on the resolved name.
+	name, desc, fetcher, err := c.resolvePull(ctx, pullCtx, ref)
 	if err != nil {
 		return nil, err
 	}
 
-	// NOTE(fuweid): unpacker defers blobs download. before create image
-	// record in ImageService, should wait for unpacking(including blobs
-	// download).
-	var ur unpack.Result
-	if unpacker != nil {
-		_, unpackSpan := tracing.StartSpan(ctx, tracing.Name(pullSpanPrefix, "UnpackWait"))
-		if ur, err = unpacker.Wait(); err != nil {
-			unpackSpan.SetStatus(err)
-			unpackSpan.End()
-			return nil, err
-		}
-		unpackSpan.SetAttributes(tracing.Attribute("unpack.count", ur.Unpacks))
-		unpackSpan.End()
+	var unpackTargets []pull.UnpackTarget
+	if pullCtx.Unpack {
+		unpackTargets = append(unpackTargets, pull.UnpackTarget{
+			SnapshotterName: unpackerSnapshotter,
+			Snapshotter:     c.SnapshotService(unpackerSnapshotter),
+			Platform:        pullCtx.PlatformMatcher,
+		})
 	}
 
-	img, err = c.createNewImage(ctx, img)
+	// The coordinator makes the image name visible only after the pull and the
+	// unpack completed and every content digest and layer snapshot has been
+	// re-confirmed. Concurrent pulls of the same name wait for this pull's
+	// result instead of writing the image a second time.
+	coordinator, err := pull.New(c.ImageService(),
+		pull.NewVerifier(c.ContentStore(), pullCtx.PlatformMatcher, unpackTargets...),
+		pull.WithLeaseManager(c.LeasesService()),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	img, err := coordinator.Do(ctx, images.Image{
+		Name:   name,
+		Target: desc,
+		Labels: pullCtx.Labels,
+	}, func(ctx context.Context) (images.Image, error) {
+		fetched, err := c.fetchResolved(ctx, pullCtx, ref, name, desc, fetcher, 1)
+		if err != nil {
+			return images.Image{}, err
+		}
+
+		// NOTE(fuweid): the unpacker defers blob downloads. The image record is
+		// committed only after the unpack, including the deferred downloads,
+		// completed.
+		if unpacker != nil {
+			_, unpackSpan := tracing.StartSpan(ctx, tracing.Name(pullSpanPrefix, "UnpackWait"))
+			if _, err = unpacker.Wait(); err != nil {
+				unpackSpan.SetStatus(err)
+				unpackSpan.End()
+				return images.Image{}, err
+			}
+			unpackSpan.End()
+		}
+		return fetched, nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -182,24 +216,16 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 	i := NewImageWithPlatform(c, img, pullCtx.PlatformMatcher)
 	span.SetAttributes(tracing.Attribute("image.ref", i.Name()))
 
-	if unpacker != nil && ur.Unpacks == 0 {
-		// Unpack was tried previously but nothing was unpacked
-		// This was at least required for schema 1 image.
-		if err := i.Unpack(ctx, pullCtx.Snapshotter, pullCtx.UnpackOpts...); err != nil {
-			return nil, fmt.Errorf("failed to unpack image on snapshotter %s: %w", pullCtx.Snapshotter, err)
-		}
-	}
-
 	return i, nil
 }
 
-func (c *Client) fetch(ctx context.Context, rCtx *RemoteContext, ref string, limit int) (images.Image, error) {
-	ctx, span := tracing.StartSpan(ctx, tracing.Name(pullSpanPrefix, "fetch"))
+func (c *Client) resolvePull(ctx context.Context, rCtx *RemoteContext, ref string) (string, ocispec.Descriptor, remotes.Fetcher, error) {
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(pullSpanPrefix, "resolve"))
 	defer span.End()
-	store := c.ContentStore()
+
 	name, desc, err := rCtx.Resolver.Resolve(ctx, ref)
 	if err != nil {
-		return images.Image{}, fmt.Errorf("failed to resolve reference %q: %w", ref, err)
+		return "", ocispec.Descriptor{}, nil, fmt.Errorf("failed to resolve reference %q: %w", ref, err)
 	}
 	span.SetAttributes(
 		tracing.Attribute("container.image.ref", ref),
@@ -208,10 +234,24 @@ func (c *Client) fetch(ctx context.Context, rCtx *RemoteContext, ref string, lim
 		tracing.Attribute("image.digest", desc.Digest.String()),
 	)
 
+	if desc.MediaType == images.MediaTypeDockerSchema1Manifest {
+		return "", ocispec.Descriptor{}, nil, fmt.Errorf("%w: media type %q is no longer supported since containerd v2.1, please rebuild the image as %q or %q",
+			errdefs.ErrNotImplemented,
+			images.MediaTypeDockerSchema1Manifest, images.MediaTypeDockerSchema2Manifest, ocispec.MediaTypeImageManifest)
+	}
+
 	fetcher, err := rCtx.Resolver.Fetcher(ctx, name)
 	if err != nil {
-		return images.Image{}, fmt.Errorf("failed to get fetcher for %q: %w", name, err)
+		return "", ocispec.Descriptor{}, nil, fmt.Errorf("failed to get fetcher for %q: %w", name, err)
 	}
+
+	return name, desc, fetcher, nil
+}
+
+func (c *Client) fetchResolved(ctx context.Context, rCtx *RemoteContext, ref string, name string, desc ocispec.Descriptor, fetcher remotes.Fetcher, limit int) (images.Image, error) {
+	ctx, span := tracing.StartSpan(ctx, tracing.Name(pullSpanPrefix, "fetch"))
+	defer span.End()
+	store := c.ContentStore()
 
 	var (
 		handler images.Handler
@@ -220,11 +260,6 @@ func (c *Client) fetch(ctx context.Context, rCtx *RemoteContext, ref string, lim
 		converterFunc func(context.Context, ocispec.Descriptor) (ocispec.Descriptor, error)
 		limiter       *semaphore.Weighted
 	)
-	if desc.MediaType == images.MediaTypeDockerSchema1Manifest {
-		return images.Image{}, fmt.Errorf("%w: media type %q is no longer supported since containerd v2.1, please rebuild the image as %q or %q",
-			errdefs.ErrNotImplemented,
-			images.MediaTypeDockerSchema1Manifest, images.MediaTypeDockerSchema2Manifest, ocispec.MediaTypeImageManifest)
-	}
 	// Get all the children for a descriptor
 	childrenHandler := images.ChildrenHandler(store)
 	if rCtx.ReferrersProvider != nil {
@@ -303,6 +338,8 @@ func (c *Client) fetch(ctx context.Context, rCtx *RemoteContext, ref string, lim
 	}, nil
 }
 
+// createNewImage registers an image record for content fetched through Fetch,
+// which does not go through pull coordination.
 func (c *Client) createNewImage(ctx context.Context, img images.Image) (images.Image, error) {
 	ctx, span := tracing.StartSpan(ctx, tracing.Name(pullSpanPrefix, "pull.createNewImage"))
 	defer span.End()

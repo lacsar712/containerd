@@ -511,7 +511,12 @@ func (c *Client) Fetch(ctx context.Context, ref string, opts ...RemoteOpt) (imag
 	}
 	defer done(ctx)
 
-	img, err := c.fetch(ctx, fetchCtx, ref, 0)
+	name, desc, fetcher, err := c.resolvePull(ctx, fetchCtx, ref)
+	if err != nil {
+		return images.Image{}, err
+	}
+
+	img, err := c.fetchResolved(ctx, fetchCtx, ref, name, desc, fetcher, 0)
 	if err != nil {
 		return images.Image{}, err
 	}

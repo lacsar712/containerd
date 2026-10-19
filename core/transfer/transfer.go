@@ -101,6 +101,24 @@ type ImageStorer interface {
 	Store(context.Context, ocispec.Descriptor, images.Store) ([]images.Image, error)
 }
 
+// PullReference is implemented by image storers which register pulled content
+// under a fixed image name (registry pulls). The pull service uses it to
+// reserve the name for the duration of the pull and only register the image
+// record once the pull is complete.
+type PullReference interface {
+	// PullReference returns the image name and labels the storer registers
+	// a registry pull under. ok is false when the storer has no fixed name.
+	PullReference() (name string, labels map[string]string, ok bool)
+}
+
+// ReferenceStorer is implemented by image storers which can register
+// additional image references while skipping one already committed reference.
+// It is used by coordinated pulls, which commit the primary image record
+// themselves.
+type ReferenceStorer interface {
+	StoreReferences(ctx context.Context, desc ocispec.Descriptor, store images.Store, skipName string) ([]images.Image, error)
+}
+
 // ImageGetter is type which returns an image from an image store
 type ImageGetter interface {
 	Get(context.Context, images.Store) (images.Image, error)

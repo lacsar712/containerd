@@ -124,6 +124,15 @@
 //	      │     │  ╘══*name* : <binary>               - Proto marshaled extension
 //	      │     └──labels
 //	      │        ╘══*key* : <string>                - Label value
+//	      ├──pulls
+//	      │  ╘══*image name*
+//	      │     ├──createdat : <binary time>         - Pull reservation created at
+//	      │     ├──heartbeat : <binary time>         - Last pull activity
+//	      │     ├──token : <string>                  - Owner token of the pull
+//	      │     └──target
+//	      │        ├──digest : <digest>              - Resolved descriptor digest
+//	      │        ├──mediatype : <string>           - Resolved descriptor media type
+//	      │        └──size : <varint>                - Resolved descriptor size
 //	      └──leases
 //	         ╘══*lease id*
 //	             ├──createdat : <binary time>         - Created at
@@ -155,6 +164,7 @@ var (
 	bucketKeyObjectIngests    = []byte("ingests")    // stores ingest objects
 	bucketKeyObjectLeases     = []byte("leases")     // stores leases
 	bucketKeyObjectSandboxes  = []byte("sandboxes")  // stores sandboxes
+	bucketKeyObjectPulls      = []byte("pulls")      // stores in-progress image pull reservations
 
 	bucketKeyDigest      = []byte("digest")
 	bucketKeyMediaType   = []byte("mediatype")
@@ -171,6 +181,8 @@ var (
 	bucketKeyTarget      = []byte("target")
 	bucketKeyExtensions  = []byte("extensions")
 	bucketKeyCreatedAt   = []byte("createdat")
+	bucketKeyHeartbeat   = []byte("heartbeat")
+	bucketKeyToken       = []byte("token")
 	bucketKeyExpected    = []byte("expected")
 	bucketKeyRef         = []byte("ref")
 	bucketKeyExpireAt    = []byte("expireat")
@@ -314,4 +326,12 @@ func getSandboxBucket(tx *bolt.Tx, namespace string) *bolt.Bucket {
 		[]byte(namespace),
 		bucketKeyObjectSandboxes,
 	)
+}
+
+func createPullsBucket(tx *bolt.Tx, namespace string) (*bolt.Bucket, error) {
+	return createBucketIfNotExists(tx, bucketKeyVersion, []byte(namespace), bucketKeyObjectPulls)
+}
+
+func getPullsBucket(tx *bolt.Tx, namespace string) *bolt.Bucket {
+	return getBucket(tx, bucketKeyVersion, []byte(namespace), bucketKeyObjectPulls)
 }

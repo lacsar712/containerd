@@ -20,15 +20,27 @@ import (
 	"context"
 
 	imagesapi "github.com/containerd/containerd/api/services/images/v1"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/errdefs/pkg/errgrpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/pull"
 	"github.com/containerd/containerd/v2/pkg/epoch"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/containerd/v2/pkg/protobuf"
 	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
 )
+
+// pullStateClient is implemented by the in-process images service, which
+// exposes the pull coordination state as Go-level methods. gRPC image clients
+// do not implement it.
+type pullStateClient interface {
+	CreatePullState(ctx context.Context, state pull.State) (pull.State, error)
+	GetPullState(ctx context.Context, name string) (pull.State, error)
+	PullHeartbeat(ctx context.Context, name, token string) (pull.State, error)
+	DeletePullState(ctx context.Context, name, token string) error
+}
 
 type remoteImages struct {
 	client imagesapi.ImagesClient
@@ -146,4 +158,36 @@ func imagesFromProto(imagespb []*imagesapi.Image) []images.Image {
 	}
 
 	return images
+}
+
+func (s *remoteImages) CreatePullState(ctx context.Context, state pull.State) (pull.State, error) {
+	c, ok := s.client.(pullStateClient)
+	if !ok {
+		return pull.State{}, errdefs.ErrNotImplemented
+	}
+	return c.CreatePullState(ctx, state)
+}
+
+func (s *remoteImages) GetPullState(ctx context.Context, name string) (pull.State, error) {
+	c, ok := s.client.(pullStateClient)
+	if !ok {
+		return pull.State{}, errdefs.ErrNotImplemented
+	}
+	return c.GetPullState(ctx, name)
+}
+
+func (s *remoteImages) PullHeartbeat(ctx context.Context, name, token string) (pull.State, error) {
+	c, ok := s.client.(pullStateClient)
+	if !ok {
+		return pull.State{}, errdefs.ErrNotImplemented
+	}
+	return c.PullHeartbeat(ctx, name, token)
+}
+
+func (s *remoteImages) DeletePullState(ctx context.Context, name, token string) error {
+	c, ok := s.client.(pullStateClient)
+	if !ok {
+		return errdefs.ErrNotImplemented
+	}
+	return c.DeletePullState(ctx, name, token)
 }

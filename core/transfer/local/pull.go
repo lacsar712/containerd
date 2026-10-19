@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/pull"
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/core/transfer"
@@ -189,6 +190,7 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 
 	// First find suitable platforms to unpack into
 	// If image storer is also an unpacker type, i.e implemented UnpackPlatforms() func
+	var matchedUnpackPlatforms []unpack.Platform
 	if iu, ok := is.(transfer.ImageUnpacker); ok {
 		unpacks := iu.UnpackPlatforms()
 		if len(unpacks) > 0 {
@@ -205,6 +207,7 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 						mu.ApplyOpts = append(mu.ApplyOpts, diff.WithProgress(progressTracker.ExtractProgress))
 					}
 					uopts = append(uopts, unpack.WithUnpackPlatform(mu))
+					matchedUnpackPlatforms = append(matchedUnpackPlatforms, mu)
 				} else {
 					log.G(ctx).WithFields(log.Fields{
 						"platform":    platforms.FormatAll(u.Platform),
@@ -233,33 +236,103 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 		}
 	}
 
-	if err := images.Dispatch(ctx, handler, nil, desc); err != nil {
+	// fetchAndUnpack downloads the content and unpacks the configured
+	// platforms without registering the image name.
+	fetchAndUnpack := func(ctx context.Context) (images.Image, error) {
+		if dispatchErr := images.Dispatch(ctx, handler, nil, desc); dispatchErr != nil {
+			if unpacker != nil {
+				// wait for unpacker to cleanup
+				unpacker.Wait()
+			}
+			return images.Image{}, dispatchErr
+		}
+
+		// NOTE(fuweid): unpacker defers blobs download. before create image
+		// record in ImageService, should wait for unpacking(including blobs
+		// download).
 		if unpacker != nil {
-			// wait for unpacker to cleanup
-			unpacker.Wait()
+			if _, waitErr := unpacker.Wait(); waitErr != nil {
+				return images.Image{}, waitErr
+			}
+			// TODO: Check results to make sure unpack was successful
 		}
-		return err
+
+		if hasMediaTypeBug1622 {
+			converted, convertErr := docker.ConvertManifest(ctx, store, desc)
+			if convertErr != nil {
+				return images.Image{}, convertErr
+			}
+			desc = converted
+		}
+		return images.Image{Name: name, Target: desc}, nil
 	}
 
-	// NOTE(fuweid): unpacker defers blobs download. before create image
-	// record in ImageService, should wait for unpacking(including blobs
-	// download).
-	if unpacker != nil {
-		if _, err = unpacker.Wait(); err != nil {
+	var imgs []images.Image
+
+	// Registry pulls which register under a fixed image name are
+	// coordinated: the name is reserved while fetching and the image record
+	// is written only once, after content and snapshots have been
+	// re-confirmed complete. Concurrent pulls of the same name wait for this
+	// result instead of writing the record again.
+	var prName string
+	var prLabels map[string]string
+	var hasPullRef bool
+	if pullRef, ok := is.(transfer.PullReference); ok {
+		prName, prLabels, hasPullRef = pullRef.PullReference()
+	}
+
+	if hasPullRef {
+		var contentPlatform platforms.MatchComparer
+		if lister, ok := is.(interface{ Platforms() []ocispec.Platform }); ok && len(lister.Platforms()) > 0 {
+			contentPlatform = platforms.Ordered(lister.Platforms()...)
+		}
+
+		targets := make([]pull.UnpackTarget, 0, len(matchedUnpackPlatforms))
+		for _, mu := range matchedUnpackPlatforms {
+			matcher, ok := mu.Platform.(platforms.MatchComparer)
+			if !ok {
+				matcher = platforms.All
+			}
+			targets = append(targets, pull.UnpackTarget{
+				SnapshotterName: mu.SnapshotterKey,
+				Snapshotter:     mu.Snapshotter,
+				Platform:        matcher,
+			})
+		}
+
+		coordinator, err := pull.New(ts.images, pull.NewVerifier(ts.content, contentPlatform, targets...))
+		if err != nil {
 			return err
 		}
-		// TODO: Check results to make sure unpack was successful
-	}
 
-	if hasMediaTypeBug1622 {
-		if desc, err = docker.ConvertManifest(ctx, store, desc); err != nil {
+		committed, err := coordinator.Do(ctx, images.Image{
+			Name:   prName,
+			Target: desc,
+			Labels: prLabels,
+		}, fetchAndUnpack)
+		if err != nil {
 			return err
 		}
-	}
 
-	imgs, err := is.Store(ctx, desc, ts.images)
-	if err != nil {
-		return err
+		// Register additional references (digest refs, prefix refs), but do
+		// not write the primary image record a second time.
+		if refStorer, ok := is.(transfer.ReferenceStorer); ok {
+			extra, err := refStorer.StoreReferences(ctx, committed.Target, ts.images, prName)
+			if err != nil {
+				return err
+			}
+			imgs = extra
+		}
+		imgs = append(imgs, committed)
+	} else {
+		image, err := fetchAndUnpack(ctx)
+		if err != nil {
+			return err
+		}
+		imgs, err = is.Store(ctx, image.Target, ts.images)
+		if err != nil {
+			return err
+		}
 	}
 
 	if tops.Progress != nil {

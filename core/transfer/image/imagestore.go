@@ -190,6 +190,15 @@ func (is *Store) String() string {
 	return fmt.Sprintf("Local Image Store (%s)", is.imageName)
 }
 
+// PullReference implements transfer.PullReference. Registry pulls register the
+// pulled content under the store's fixed image name.
+func (is *Store) PullReference() (string, map[string]string, bool) {
+	if is.imageName == "" {
+		return "", nil, false
+	}
+	return is.imageName, is.imageLabels, true
+}
+
 func (is *Store) ImageFilter(h images.HandlerFunc, cs content.Store) images.HandlerFunc {
 	var p platforms.MatchComparer
 	if len(is.platforms) == 0 {
@@ -215,6 +224,61 @@ func (is *Store) ImageFilter(h images.HandlerFunc, cs content.Store) images.Hand
 }
 
 func (is *Store) Store(ctx context.Context, desc ocispec.Descriptor, store images.Store) ([]images.Image, error) {
+	imgs, err := is.imagesForStore(desc)
+	if err != nil {
+		return nil, err
+	}
+	return persistImages(ctx, imgs, store)
+}
+
+// StoreReferences stores every reference for desc except for skipName, which
+// is assumed to have already been committed by the pull coordinator. It is
+// used at the end of a coordinated pull to register additional references
+// without writing the primary image record a second time.
+func (is *Store) StoreReferences(ctx context.Context, desc ocispec.Descriptor, store images.Store, skipName string) ([]images.Image, error) {
+	imgs, err := is.imagesForStore(desc)
+	if err != nil {
+		return nil, err
+	}
+
+	filtered := imgs[:0]
+	for _, img := range imgs {
+		if img.Name != skipName {
+			filtered = append(filtered, img)
+		}
+	}
+	return persistImages(ctx, filtered, store)
+}
+
+func persistImages(ctx context.Context, imgs []images.Image, store images.Store) ([]images.Image, error) {
+	for i := 0; i < len(imgs); {
+		if created, err := store.Create(ctx, imgs[i]); err != nil {
+			if !errdefs.IsAlreadyExists(err) {
+				return nil, err
+			}
+
+			updated, err := store.Update(ctx, imgs[i])
+			if err != nil {
+				// if image was removed, try create again
+				if errdefs.IsNotFound(err) {
+					// Keep trying same image
+					continue
+				}
+				return nil, err
+			}
+
+			imgs[i] = updated
+		} else {
+			imgs[i] = created
+		}
+
+		i++
+	}
+
+	return imgs, nil
+}
+
+func (is *Store) imagesForStore(desc ocispec.Descriptor) ([]images.Image, error) {
 	var imgs []images.Image
 
 	// extraRefLabels returns image labels for extra references, adding
@@ -321,30 +385,6 @@ func (is *Store) Store(ctx context.Context, desc ocispec.Descriptor, store image
 
 	if len(imgs) == 0 {
 		return nil, fmt.Errorf("no image name found: %w", errdefs.ErrNotFound)
-	}
-
-	for i := 0; i < len(imgs); {
-		if created, err := store.Create(ctx, imgs[i]); err != nil {
-			if !errdefs.IsAlreadyExists(err) {
-				return nil, err
-			}
-
-			updated, err := store.Update(ctx, imgs[i])
-			if err != nil {
-				// if image was removed, try create again
-				if errdefs.IsNotFound(err) {
-					// Keep trying same image
-					continue
-				}
-				return nil, err
-			}
-
-			imgs[i] = updated
-		} else {
-			imgs[i] = created
-		}
-
-		i++
 	}
 
 	return imgs, nil

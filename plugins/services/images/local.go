@@ -30,6 +30,7 @@ import (
 	"github.com/containerd/plugin/registry"
 
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/pull"
 	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/pkg/epoch"
 	"github.com/containerd/containerd/v2/pkg/gc"
@@ -184,4 +185,56 @@ func (l *local) Delete(ctx context.Context, req *imagesapi.DeleteImageRequest, _
 	}
 
 	return empty, nil
+}
+
+// CreatePullState is a Go-level entry point for in-process pull coordination;
+// pull reservations are not exposed over gRPC.
+func (l *local) CreatePullState(ctx context.Context, state pull.State) (pull.State, error) {
+	ss, ok := l.store.(pull.StateStore)
+	if !ok {
+		return pull.State{}, status.Error(codes.Unimplemented, "pull state store is not available")
+	}
+	state, err := ss.CreatePullState(ctx, state)
+	if err != nil {
+		return pull.State{}, errgrpc.ToGRPC(err)
+	}
+	return state, nil
+}
+
+// GetPullState is a Go-level entry point for in-process pull coordination.
+func (l *local) GetPullState(ctx context.Context, name string) (pull.State, error) {
+	ss, ok := l.store.(pull.StateStore)
+	if !ok {
+		return pull.State{}, status.Error(codes.Unimplemented, "pull state store is not available")
+	}
+	state, err := ss.GetPullState(ctx, name)
+	if err != nil {
+		return pull.State{}, errgrpc.ToGRPC(err)
+	}
+	return state, nil
+}
+
+// PullHeartbeat is a Go-level entry point for in-process pull coordination.
+func (l *local) PullHeartbeat(ctx context.Context, name, token string) (pull.State, error) {
+	ss, ok := l.store.(pull.StateStore)
+	if !ok {
+		return pull.State{}, status.Error(codes.Unimplemented, "pull state store is not available")
+	}
+	state, err := ss.PullHeartbeat(ctx, name, token)
+	if err != nil {
+		return pull.State{}, errgrpc.ToGRPC(err)
+	}
+	return state, nil
+}
+
+// DeletePullState is a Go-level entry point for in-process pull coordination.
+func (l *local) DeletePullState(ctx context.Context, name, token string) error {
+	ss, ok := l.store.(pull.StateStore)
+	if !ok {
+		return status.Error(codes.Unimplemented, "pull state store is not available")
+	}
+	if err := ss.DeletePullState(ctx, name, token); err != nil {
+		return errgrpc.ToGRPC(err)
+	}
+	return nil
 }
